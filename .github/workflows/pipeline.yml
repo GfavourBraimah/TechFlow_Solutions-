@@ -1,0 +1,157 @@
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  # ─── Job 1: Run Tests ───────────────────────────────────────────────────────
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pytest
+        run: pytest test_app.py -v
+
+  # ─── Job 2: Build & Push Docker Image ───────────────────────────────────────
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test  # Only runs if tests pass
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:${{ github.sha }}
+
+  # ─── Job 3: Deploy to EC2 ───────────────────────────────────────────────────
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-push  # Only runs if build passes
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Copy scripts to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "scripts/"
+          target: "/home/ubuntu/"
+
+      - name: Deploy on EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: DOCKERHUB_USERNAME
+          script: |
+            export DOCKERHUB_USERNAME="${{ secrets.DOCKERHUB_USERNAME }}"
+            export IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:latest"
+
+            # Make scripts executable
+            chmod +x /home/ubuntu/scripts/*.sh
+
+            # Tag current running image as previous_stable (for rollback)
+            /home/ubuntu/scripts/tag_stable.sh "$DOCKERHUB_USERNAME" || echo "No previous stable to tag"
+
+            # Pull latest image
+            docker pull "$IMAGE"
+
+            # Stop and remove old container (if running)
+            docker stop techflow-app 2>/dev/null || true
+            docker rm   techflow-app 2>/dev/null || true
+
+            # Start new container
+            docker run -d \
+              --name techflow-app \
+              --restart unless-stopped \
+              -p 80:5000 \
+              "$IMAGE"
+
+            # Health check — rollback on failure
+            if /home/ubuntu/scripts/health_check.sh; then
+              echo "✅ Deployment successful!"
+            else
+              echo "❌ Health check failed — rolling back..."
+              /home/ubuntu/scripts/rollback.sh "$DOCKERHUB_USERNAME"
+              exit 1
+            fi
+
+      - name: Send success email
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_APP_PASSWORD }}
+          subject: "✅ TechFlow Deployment Succeeded — ${{ github.sha }}"
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          from: ${{ secrets.EMAIL_USERNAME }}
+          body: |
+            🚀 Deployment to production was successful!
+
+            Commit: ${{ github.sha }}
+            Branch: ${{ github.ref_name }}
+            Triggered by: ${{ github.actor }}
+
+            Your app is live at: http://${{ secrets.EC2_HOST }}
+
+      - name: Send failure email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_APP_PASSWORD }}
+          subject: "❌ TechFlow Deployment FAILED — ${{ github.sha }}"
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          from: ${{ secrets.EMAIL_USERNAME }}
+          body: |
+            ⚠️ Deployment failed and was automatically rolled back.
+
+            Commit: ${{ github.sha }}
+            Branch: ${{ github.ref_name }}
+            Triggered by: ${{ github.actor }}
+
+            Check the Actions tab for logs: https://github.com/${{ github.repository }}/actions
